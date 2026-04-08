@@ -33,8 +33,34 @@ import {
   deleteDoc, 
   doc, 
   setDoc,
-  orderBy
+  orderBy,
+  getDocFromServer
 } from 'firebase/firestore';
+
+// --- Error Handling ---
+enum OperationType {
+  CREATE = 'create',
+  UPDATE = 'update',
+  DELETE = 'delete',
+  LIST = 'list',
+  GET = 'get',
+  WRITE = 'write',
+}
+
+function handleFirestoreError(error: unknown, operationType: OperationType, path: string | null) {
+  const errInfo = {
+    error: error instanceof Error ? error.message : String(error),
+    authInfo: {
+      userId: auth.currentUser?.uid,
+      email: auth.currentUser?.email,
+      emailVerified: auth.currentUser?.emailVerified,
+    },
+    operationType,
+    path
+  };
+  console.error('Firestore Error: ', JSON.stringify(errInfo));
+  // alert(`데이터 작업 중 오류가 발생했습니다: ${errInfo.error}`);
+}
 
 // --- Utils ---
 const pad = (n: number) => String(n).padStart(2, '0');
@@ -49,7 +75,61 @@ const formatDate = (s: string) => {
   return `${p[0]}.${p[1]}.${p[2]}`;
 };
 
+// --- Error Boundary ---
+class ErrorBoundary extends React.Component<{ children: React.ReactNode }, { hasError: boolean, error: any }> {
+  constructor(props: any) {
+    super(props);
+    this.state = { hasError: false, error: null };
+  }
+
+  static getDerivedStateFromError(error: any) {
+    return { hasError: true, error };
+  }
+
+  componentDidCatch(error: any, errorInfo: any) {
+    console.error("ErrorBoundary caught an error", error, errorInfo);
+  }
+
+  render() {
+    if (this.state.hasError) {
+      let errorMessage = "알 수 없는 오류가 발생했습니다.";
+      try {
+        const parsed = JSON.parse(this.state.error.message);
+        if (parsed.error) errorMessage = parsed.error;
+      } catch {
+        errorMessage = this.state.error.message || String(this.state.error);
+      }
+
+      return (
+        <div className="min-h-screen flex flex-col items-center justify-center bg-red-50 p-6 text-center">
+          <div className="w-16 h-16 rounded-full bg-red-100 flex items-center justify-center text-red-600 mb-6">
+            <X size={32} />
+          </div>
+          <h1 className="text-xl font-bold text-red-900 mb-2">문제가 발생했습니다</h1>
+          <p className="text-red-700/70 mb-8 max-w-md">{errorMessage}</p>
+          <button 
+            onClick={() => window.location.reload()}
+            className="btn bg-red-600 text-white hover:bg-red-700 px-8 py-2"
+          >
+            페이지 새로고침
+          </button>
+        </div>
+      );
+    }
+
+    return this.props.children;
+  }
+}
+
 export default function App() {
+  return (
+    <ErrorBoundary>
+      <AppContent />
+    </ErrorBoundary>
+  );
+}
+
+function AppContent() {
   // --- Auth State ---
   const [user, setUser] = useState<User | null>(null);
   const [isAuthReady, setIsAuthReady] = useState(false);
@@ -86,6 +166,19 @@ export default function App() {
       setUser(u);
       setIsAuthReady(true);
     });
+
+    // Test Connection
+    const testConnection = async () => {
+      try {
+        await getDocFromServer(doc(db, 'test', 'connection'));
+      } catch (error: any) {
+        if (error.message?.includes('the client is offline')) {
+          console.error("Firebase connection failed. Please check your configuration.");
+        }
+      }
+    };
+    testConnection();
+
     return () => unsubscribe();
   }, []);
 
@@ -97,25 +190,28 @@ export default function App() {
     }
 
     // Sync Students
-    const qStudents = query(collection(db, 'students'), where('ownerId', '==', user.uid));
+    const pathStudents = 'students';
+    const qStudents = query(collection(db, pathStudents), where('ownerId', '==', user.uid));
     const unsubStudents = onSnapshot(qStudents, (snapshot) => {
       setStudents(snapshot.docs.map(d => ({ id: d.id, ...d.data() } as Student)));
-    });
+    }, (error) => handleFirestoreError(error, OperationType.LIST, pathStudents));
 
     // Sync Sessions
-    const qSessions = query(collection(db, 'sessions'), where('ownerId', '==', user.uid), orderBy('num', 'desc'));
+    const pathSessions = 'sessions';
+    const qSessions = query(collection(db, pathSessions), where('ownerId', '==', user.uid), orderBy('num', 'desc'));
     const unsubSessions = onSnapshot(qSessions, (snapshot) => {
       setSessions(snapshot.docs.map(d => ({ id: d.id, ...d.data() } as Session)));
-    });
+    }, (error) => handleFirestoreError(error, OperationType.LIST, pathSessions));
 
     // Sync Config
-    const unsubConfig = onSnapshot(doc(db, 'configs', user.uid), (snapshot) => {
+    const pathConfig = 'configs';
+    const unsubConfig = onSnapshot(doc(db, pathConfig, user.uid), (snapshot) => {
       if (snapshot.exists()) {
         const data = snapshot.data();
         if (data.techniques) setTechniques(data.techniques);
         if (data.levels) setLevels(data.levels);
       }
-    });
+    }, (error) => handleFirestoreError(error, OperationType.GET, `${pathConfig}/${user.uid}`));
 
     return () => {
       unsubStudents();
@@ -148,7 +244,7 @@ export default function App() {
       setIsStudentModalOpen(false);
       setEditingStudent(null);
     } catch (err) {
-      console.error("Error saving student:", err);
+      handleFirestoreError(err, editingStudent ? OperationType.UPDATE : OperationType.CREATE, 'students');
       alert("수강생 저장 중 오류가 발생했습니다.");
     }
   };
@@ -164,7 +260,7 @@ export default function App() {
         }
         if (selectedStudentId === id) setSelectedStudentId(null);
       } catch (err) {
-        console.error("Error deleting student:", err);
+        handleFirestoreError(err, OperationType.DELETE, `students/${id}`);
       }
     }
   };
@@ -197,7 +293,7 @@ export default function App() {
       setActiveTab('list');
       setSelectedStudentId(sessionStudentId);
     } catch (err) {
-      console.error("Error saving session:", err);
+      handleFirestoreError(err, OperationType.CREATE, 'sessions');
       alert("세션 저장 중 오류가 발생했습니다.");
     }
   };
@@ -218,7 +314,7 @@ export default function App() {
       setIsSessionModalOpen(false);
       setEditingSession(null);
     } catch (err) {
-      console.error("Error updating session:", err);
+      handleFirestoreError(err, OperationType.UPDATE, `sessions/${editingSession.id}`);
       alert("세션 수정 중 오류가 발생했습니다.");
     }
   };
@@ -230,7 +326,7 @@ export default function App() {
         setIsSessionModalOpen(false);
         setEditingSession(null);
       } catch (err) {
-        console.error("Error deleting session:", err);
+        handleFirestoreError(err, OperationType.DELETE, `sessions/${id}`);
       }
     }
   };
@@ -244,7 +340,7 @@ export default function App() {
         ownerId: user.uid
       });
     } catch (err) {
-      console.error("Error updating config:", err);
+      handleFirestoreError(err, OperationType.WRITE, `configs/${user.uid}`);
     }
   };
 
