@@ -1,0 +1,5 @@
+{
+  "name": "NCC 수강생 관리 — 마음이발소",
+  "description": "마음이발소 코칭 수강생 관리 및 AI 기반 세션 기록 시스템",
+  "requestFramePermissions": ["microphone"]
+}
