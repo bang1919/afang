@@ -1,0 +1,60 @@
+{
+  "entities": {
+    "Student": {
+      "title": "Student",
+      "description": "NCC coaching student information",
+      "type": "object",
+      "properties": {
+        "name": { "type": "string", "description": "Student name" },
+        "goal": { "type": "string", "description": "Coaching goal" },
+        "startDate": { "type": "string", "format": "date", "description": "Start date of coaching" },
+        "level": { "type": "string", "description": "NCC level" },
+        "pattern": { "type": "string", "description": "Core pattern notes" },
+        "ownerId": { "type": "string", "description": "UID of the coach who owns this record" }
+      },
+      "required": ["name", "level", "ownerId"]
+    },
+    "Session": {
+      "title": "Session",
+      "description": "Coaching session record",
+      "type": "object",
+      "properties": {
+        "studentId": { "type": "string", "description": "Reference to Student document ID" },
+        "num": { "type": "number", "description": "Session number" },
+        "date": { "type": "string", "format": "date", "description": "Session date" },
+        "reaction": { "type": "string", "description": "Student reaction or raw notes" },
+        "next": { "type": "string", "description": "Next session direction" },
+        "techniques": { "type": "array", "items": { "type": "string" }, "description": "List of NCC techniques used" },
+        "aiSummary": { "type": "string", "description": "AI structured summary" },
+        "mode": { "type": "string", "enum": ["voice", "text"], "description": "Input mode" },
+        "ownerId": { "type": "string", "description": "UID of the coach who owns this record" }
+      },
+      "required": ["studentId", "num", "date", "ownerId"]
+    },
+    "Config": {
+      "title": "Config",
+      "description": "User specific configurations like techniques and levels",
+      "type": "object",
+      "properties": {
+        "techniques": { "type": "array", "items": { "type": "string" } },
+        "levels": { "type": "array", "items": { "type": "string" } },
+        "ownerId": { "type": "string" }
+      },
+      "required": ["ownerId"]
+    }
+  },
+  "firestore": {
+    "/students/{studentId}": {
+      "schema": "Student",
+      "description": "Collection of students"
+    },
+    "/sessions/{sessionId}": {
+      "schema": "Session",
+      "description": "Collection of coaching sessions"
+    },
+    "/configs/{configId}": {
+      "schema": "Config",
+      "description": "User configurations"
+    }
+  }
+}

@@ -1,6 +1,11 @@
 import { GoogleGenerativeAI } from "@google/generative-ai";
 
-const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY || "");
+// Use a fallback to avoid "process is not defined" errors in some environments
+const apiKey = (typeof process !== 'undefined' && process.env?.GEMINI_API_KEY) 
+  ? process.env.GEMINI_API_KEY 
+  : (import.meta as any).env?.VITE_GEMINI_API_KEY || "";
+
+const genAI = new GoogleGenerativeAI(apiKey);
 
 export async function summarizeSession(studentName: string, sessionNum: number, content: string) {
   try {

@@ -5,6 +5,7 @@ export interface Student {
   startDate: string;
   level: string;
   pattern: string;
+  ownerId: string;
 }
 
 export interface Session {
@@ -17,6 +18,7 @@ export interface Session {
   techniques: string[];
   aiSummary: string;
   mode: 'voice' | 'text';
+  ownerId: string;
 }
 
 export type TabType = 'list' | 'session' | 'manage';

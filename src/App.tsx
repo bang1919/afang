@@ -5,8 +5,6 @@ import {
   Settings, 
   Plus, 
   Search, 
-  Mic, 
-  MicOff, 
   FileText, 
   Save, 
   FolderOpen, 
@@ -20,6 +18,23 @@ import {
 import { motion, AnimatePresence } from 'motion/react';
 import { Student, Session, TabType } from './types';
 import { summarizeSession } from './lib/gemini';
+import { auth, db, loginWithGoogle, logout } from './firebase';
+import { 
+  onAuthStateChanged, 
+  User 
+} from 'firebase/auth';
+import { 
+  collection, 
+  onSnapshot, 
+  query, 
+  where, 
+  addDoc, 
+  updateDoc, 
+  deleteDoc, 
+  doc, 
+  setDoc,
+  orderBy
+} from 'firebase/firestore';
 
 // --- Utils ---
 const pad = (n: number) => String(n).padStart(2, '0');
@@ -35,6 +50,10 @@ const formatDate = (s: string) => {
 };
 
 export default function App() {
+  // --- Auth State ---
+  const [user, setUser] = useState<User | null>(null);
+  const [isAuthReady, setIsAuthReady] = useState(false);
+
   // --- State ---
   const [students, setStudents] = useState<Student[]>([]);
   const [sessions, setSessions] = useState<Session[]>([]);
@@ -48,13 +67,12 @@ export default function App() {
   // Modals
   const [isStudentModalOpen, setIsStudentModalOpen] = useState(false);
   const [editingStudent, setEditingStudent] = useState<Student | null>(null);
+  const [isSessionModalOpen, setIsSessionModalOpen] = useState(false);
+  const [editingSession, setEditingSession] = useState<Session | null>(null);
   
   // Session Form
   const [sessionStudentId, setSessionStudentId] = useState('');
   const [sessionDate, setSessionDate] = useState(todayStr());
-  const [sessionMode, setSessionMode] = useState<'voice' | 'text'>('voice');
-  const [voiceText, setVoiceText] = useState('');
-  const [isRecording, setIsRecording] = useState(false);
   const [freeText, setFreeText] = useState('');
   const [aiSummary, setAiSummary] = useState('');
   const [isAiLoading, setIsAiLoading] = useState(false);
@@ -62,90 +80,176 @@ export default function App() {
   const [reaction, setReaction] = useState('');
   const [nextStep, setNextStep] = useState('');
 
-  const recognitionRef = useRef<any>(null);
-
-  // --- Persistence ---
+  // --- Firebase Auth & Sync ---
   useEffect(() => {
-    const savedStudents = localStorage.getItem('ncc_students');
-    const savedSessions = localStorage.getItem('ncc_sessions');
-    const savedTechs = localStorage.getItem('ncc_techs');
-    const savedLevels = localStorage.getItem('ncc_levels');
-    
-    if (savedStudents) setStudents(JSON.parse(savedStudents));
-    if (savedSessions) setSessions(JSON.parse(savedSessions));
-    if (savedTechs) setTechniques(JSON.parse(savedTechs));
-    if (savedLevels) setLevels(JSON.parse(savedLevels));
+    const unsubscribe = onAuthStateChanged(auth, (u) => {
+      setUser(u);
+      setIsAuthReady(true);
+    });
+    return () => unsubscribe();
   }, []);
 
   useEffect(() => {
-    localStorage.setItem('ncc_students', JSON.stringify(students));
-    localStorage.setItem('ncc_sessions', JSON.stringify(sessions));
-    localStorage.setItem('ncc_techs', JSON.stringify(techniques));
-    localStorage.setItem('ncc_levels', JSON.stringify(levels));
-  }, [students, sessions, techniques, levels]);
+    if (!user) {
+      setStudents([]);
+      setSessions([]);
+      return;
+    }
+
+    // Sync Students
+    const qStudents = query(collection(db, 'students'), where('ownerId', '==', user.uid));
+    const unsubStudents = onSnapshot(qStudents, (snapshot) => {
+      setStudents(snapshot.docs.map(d => ({ id: d.id, ...d.data() } as Student)));
+    });
+
+    // Sync Sessions
+    const qSessions = query(collection(db, 'sessions'), where('ownerId', '==', user.uid), orderBy('num', 'desc'));
+    const unsubSessions = onSnapshot(qSessions, (snapshot) => {
+      setSessions(snapshot.docs.map(d => ({ id: d.id, ...d.data() } as Session)));
+    });
+
+    // Sync Config
+    const unsubConfig = onSnapshot(doc(db, 'configs', user.uid), (snapshot) => {
+      if (snapshot.exists()) {
+        const data = snapshot.data();
+        if (data.techniques) setTechniques(data.techniques);
+        if (data.levels) setLevels(data.levels);
+      }
+    });
+
+    return () => {
+      unsubStudents();
+      unsubSessions();
+      unsubConfig();
+    };
+  }, [user]);
 
   // --- Handlers ---
-  const handleAddStudent = (e: React.FormEvent<HTMLFormElement>) => {
+  const handleAddStudent = async (e: React.FormEvent<HTMLFormElement>) => {
     e.preventDefault();
+    if (!user) return;
     const formData = new FormData(e.currentTarget);
-    const newStudent: Student = {
-      id: editingStudent?.id || crypto.randomUUID(),
+    const studentData = {
       name: formData.get('name') as string,
       goal: formData.get('goal') as string,
       startDate: formData.get('startDate') as string,
       level: formData.get('level') as string,
       pattern: formData.get('pattern') as string,
+      ownerId: user.uid
     };
 
-    if (editingStudent) {
-      setStudents(students.map(s => s.id === editingStudent.id ? newStudent : s));
-    } else {
-      setStudents([...students, newStudent]);
-      setSelectedStudentId(newStudent.id);
+    try {
+      if (editingStudent) {
+        await updateDoc(doc(db, 'students', editingStudent.id), studentData);
+      } else {
+        const docRef = await addDoc(collection(db, 'students'), studentData);
+        setSelectedStudentId(docRef.id);
+      }
+      setIsStudentModalOpen(false);
+      setEditingStudent(null);
+    } catch (err) {
+      console.error("Error saving student:", err);
+      alert("수강생 저장 중 오류가 발생했습니다.");
     }
-    setIsStudentModalOpen(false);
-    setEditingStudent(null);
   };
 
-  const handleDeleteStudent = (id: string) => {
+  const handleDeleteStudent = async (id: string) => {
     if (window.confirm('수강생을 삭제할까요? 세션 기록도 함께 삭제됩니다.')) {
-      setStudents(students.filter(s => s.id !== id));
-      setSessions(sessions.filter(se => se.studentId !== id));
-      if (selectedStudentId === id) setSelectedStudentId(null);
+      try {
+        await deleteDoc(doc(db, 'students', id));
+        // Also delete sessions for this student
+        const studentSessions = sessions.filter(s => s.studentId === id);
+        for (const s of studentSessions) {
+          await deleteDoc(doc(db, 'sessions', s.id));
+        }
+        if (selectedStudentId === id) setSelectedStudentId(null);
+      } catch (err) {
+        console.error("Error deleting student:", err);
+      }
     }
   };
 
-  const handleSaveSession = () => {
-    if (!sessionStudentId) return alert('수강생을 선택해주세요.');
+  const handleSaveSession = async () => {
+    if (!user || !sessionStudentId) return alert('수강생을 선택해주세요.');
     const studentSessions = sessions.filter(s => s.studentId === sessionStudentId);
-    const newSession: Session = {
-      id: crypto.randomUUID(),
+    const sessionData = {
       studentId: sessionStudentId,
       num: studentSessions.length + 1,
       date: sessionDate,
-      reaction: reaction || (sessionMode === 'voice' ? voiceText : freeText),
+      reaction: reaction || freeText,
       next: nextStep,
       techniques: selectedTechs,
       aiSummary: aiSummary,
-      mode: sessionMode,
+      mode: 'text',
+      ownerId: user.uid
     };
 
-    setSessions([...sessions, newSession]);
-    alert('세션이 저장되었습니다.');
+    try {
+      await addDoc(collection(db, 'sessions'), sessionData);
+      alert('세션이 저장되었습니다.');
+      
+      // Reset form
+      setAiSummary('');
+      setFreeText('');
+      setSelectedTechs([]);
+      setReaction('');
+      setNextStep('');
+      setActiveTab('list');
+      setSelectedStudentId(sessionStudentId);
+    } catch (err) {
+      console.error("Error saving session:", err);
+      alert("세션 저장 중 오류가 발생했습니다.");
+    }
+  };
+
+  const handleUpdateSession = async (e: React.FormEvent<HTMLFormElement>) => {
+    e.preventDefault();
+    if (!user || !editingSession) return;
+    const formData = new FormData(e.currentTarget);
     
-    // Reset form
-    setAiSummary('');
-    setVoiceText('');
-    setFreeText('');
-    setSelectedTechs([]);
-    setReaction('');
-    setNextStep('');
-    setActiveTab('list');
-    setSelectedStudentId(sessionStudentId);
+    const updatedData = {
+      reaction: formData.get('reaction') as string,
+      next: formData.get('next') as string,
+      aiSummary: formData.get('aiSummary') as string,
+    };
+
+    try {
+      await updateDoc(doc(db, 'sessions', editingSession.id), updatedData);
+      setIsSessionModalOpen(false);
+      setEditingSession(null);
+    } catch (err) {
+      console.error("Error updating session:", err);
+      alert("세션 수정 중 오류가 발생했습니다.");
+    }
+  };
+
+  const handleDeleteSession = async (id: string) => {
+    if (window.confirm('이 세션 기록을 삭제할까요?')) {
+      try {
+        await deleteDoc(doc(db, 'sessions', id));
+        setIsSessionModalOpen(false);
+        setEditingSession(null);
+      } catch (err) {
+        console.error("Error deleting session:", err);
+      }
+    }
+  };
+
+  const updateConfig = async (newTechs: string[], newLevels: string[]) => {
+    if (!user) return;
+    try {
+      await setDoc(doc(db, 'configs', user.uid), {
+        techniques: newTechs,
+        levels: newLevels,
+        ownerId: user.uid
+      });
+    } catch (err) {
+      console.error("Error updating config:", err);
+    }
   };
 
   const handleRunAI = async () => {
-    const content = sessionMode === 'voice' ? voiceText : freeText;
+    const content = freeText;
     if (!content) return alert('내용을 입력해주세요.');
     
     const student = students.find(s => s.id === sessionStudentId);
@@ -160,34 +264,6 @@ export default function App() {
       alert('AI 요약 중 오류가 발생했습니다.');
     } finally {
       setIsAiLoading(false);
-    }
-  };
-
-  const toggleRecording = () => {
-    if (isRecording) {
-      recognitionRef.current?.stop();
-      setIsRecording(false);
-    } else {
-      const SpeechRecognition = (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
-      if (!SpeechRecognition) return alert('이 브라우저는 음성 인식을 지원하지 않습니다.');
-
-      const recognition = new SpeechRecognition();
-      recognition.lang = 'ko-KR';
-      recognition.continuous = true;
-      recognition.interimResults = true;
-
-      recognition.onresult = (event: any) => {
-        let transcript = '';
-        for (let i = event.resultIndex; i < event.results.length; i++) {
-          transcript += event.results[i][0].transcript;
-        }
-        setVoiceText(transcript);
-      };
-
-      recognition.onend = () => setIsRecording(false);
-      recognition.start();
-      recognitionRef.current = recognition;
-      setIsRecording(true);
     }
   };
 
@@ -230,25 +306,60 @@ export default function App() {
     .filter(s => s.studentId === selectedStudentId)
     .sort((a, b) => b.num - a.num);
 
+  if (!isAuthReady) {
+    return (
+      <div className="min-h-screen flex items-center justify-center bg-[#f5f5f2]">
+        <div className="w-8 h-8 border-4 border-teal-500 border-t-transparent rounded-full animate-spin" />
+      </div>
+    );
+  }
+
+  if (!user) {
+    return (
+      <div className="min-h-screen flex flex-col items-center justify-center bg-[#f5f5f2] p-6">
+        <div className="w-16 h-16 rounded-2xl bg-teal-500 flex items-center justify-center text-white mb-6 shadow-lg shadow-teal-500/20">
+          <Users size={32} />
+        </div>
+        <h1 className="text-2xl font-bold mb-2">NCC 수강생 관리</h1>
+        <p className="text-black/40 mb-8 text-center max-w-xs">마음이발소 코칭 기록 시스템에 로그인하여 데이터를 안전하게 보관하세요.</p>
+        <button 
+          onClick={loginWithGoogle}
+          className="btn btn-primary px-8 py-3 text-base shadow-lg shadow-teal-500/20"
+        >
+          Google로 시작하기
+        </button>
+      </div>
+    );
+  }
+
   return (
     <div className="min-h-screen flex flex-col">
       {/* Header */}
       <header className="bg-white border-b border-black/5 px-6 py-4 sticky top-0 z-40">
         <div className="max-w-4xl mx-auto flex items-center justify-between">
-          <div>
-            <div className="flex items-center gap-2">
-              <div className="w-2.5 h-2.5 rounded-full bg-teal-500" />
-              <h1 className="text-lg font-bold tracking-tight">NCC 수강생 관리</h1>
+          <div className="flex items-center gap-4">
+            <div>
+              <div className="flex items-center gap-2">
+                <div className="w-2.5 h-2.5 rounded-full bg-teal-500" />
+                <h1 className="text-lg font-bold tracking-tight">NCC 수강생 관리</h1>
+              </div>
+              <p className="text-xs text-black/40 mt-0.5 font-medium">마음이발소 코칭 기록 시스템</p>
             </div>
-            <p className="text-xs text-black/40 mt-0.5 font-medium">마음이발소 코칭 기록 시스템</p>
           </div>
-          <button 
-            onClick={() => { setEditingStudent(null); setIsStudentModalOpen(true); }}
-            className="btn btn-primary"
-          >
-            <Plus size={16} />
-            수강생 추가
-          </button>
+          <div className="flex items-center gap-4">
+            <div className="hidden md:flex items-center gap-2 px-3 py-1.5 bg-black/5 rounded-lg">
+              <img src={user.photoURL || ''} alt="" className="w-5 h-5 rounded-full" />
+              <span className="text-xs font-medium">{user.displayName}</span>
+            </div>
+            <button onClick={logout} className="text-xs text-black/40 hover:text-black/60 font-medium">로그아웃</button>
+            <button 
+              onClick={() => { setEditingStudent(null); setIsStudentModalOpen(true); }}
+              className="btn btn-primary"
+            >
+              <Plus size={16} />
+              수강생 추가
+            </button>
+          </div>
         </div>
       </header>
 
@@ -423,45 +534,49 @@ export default function App() {
                           <p className="text-sm text-black/30 py-4">아직 세션 기록이 없습니다.</p>
                         ) : (
                           studentSessions.map((sess) => (
-                            <div key={sess.id} className="relative">
-                              <div className="absolute -left-[22px] top-1.5 w-3 h-3 rounded-full bg-teal-500 border-2 border-white shadow-sm" />
-                              <div className="card p-4">
+                            <button 
+                              key={sess.id} 
+                              onClick={() => {
+                                setEditingSession(sess);
+                                setIsSessionModalOpen(true);
+                              }}
+                              className="w-full text-left relative group"
+                            >
+                              <div className="absolute -left-[22px] top-1.5 w-3 h-3 rounded-full bg-teal-500 border-2 border-white shadow-sm group-hover:scale-125 transition-transform" />
+                              <div className="card p-4 hover:border-teal-200 transition-all hover:shadow-md">
                                 <div className="flex items-center justify-between mb-3">
                                   <div className="flex items-center gap-3">
                                     <span className="text-sm font-bold text-teal-600">{sess.num}회기</span>
                                     <span className="text-xs text-black/30">{formatDate(sess.date)}</span>
                                   </div>
                                   <div className="text-black/20">
-                                    {sess.mode === 'voice' ? <Mic size={14} /> : <FileText size={14} />}
+                                    <FileText size={14} />
                                   </div>
                                 </div>
                                 
-                                {sess.aiSummary ? (
-                                  <div className="text-sm leading-relaxed whitespace-pre-wrap mb-3 text-black/80">
-                                    {sess.aiSummary}
-                                  </div>
-                                ) : (
-                                  <div className="text-sm leading-relaxed whitespace-pre-wrap mb-3 text-black/80">
-                                    {sess.reaction}
-                                  </div>
-                                )}
+                                 <div className="space-y-4">
+                                  {/* AI Summary (Primary view) */}
+                                  {sess.aiSummary ? (
+                                    <div className="text-sm leading-relaxed whitespace-pre-wrap text-black/80">
+                                      {sess.aiSummary}
+                                    </div>
+                                  ) : (
+                                    <div className="text-sm leading-relaxed whitespace-pre-wrap text-black/40 italic">
+                                      {sess.reaction.substring(0, 100)}{sess.reaction.length > 100 ? '...' : ''}
+                                      <p className="text-[10px] mt-1 not-italic">(요약 없음 - 클릭하여 전체 보기)</p>
+                                    </div>
+                                  )}
+                                </div>
 
-                                <div className="flex flex-wrap gap-1.5 mb-3">
+                                <div className="flex flex-wrap gap-1.5 mt-3">
                                   {sess.techniques.map(t => (
                                     <span key={t} className="px-2 py-0.5 bg-teal-50 text-teal-700 text-[10px] font-bold rounded">
                                       {t}
                                     </span>
                                   ))}
                                 </div>
-
-                                {sess.next && (
-                                  <div className="text-xs text-black/50 flex items-start gap-1.5 pt-3 border-t border-black/5">
-                                    <ChevronRight size={14} className="mt-0.5 shrink-0" />
-                                    <span>다음: {sess.next}</span>
-                                  </div>
-                                )}
                               </div>
-                            </div>
+                            </button>
                           ))
                         )}
                       </div>
@@ -516,87 +631,39 @@ export default function App() {
                 </p>
               )}
 
-              {/* Mode Switcher */}
-              <div className="flex p-1 bg-black/5 rounded-xl">
-                <button 
-                  onClick={() => setSessionMode('voice')}
-                  className={`flex-1 flex items-center justify-center gap-2 py-2.5 rounded-lg text-sm font-medium transition-all ${
-                    sessionMode === 'voice' ? 'bg-white shadow-sm text-teal-600' : 'text-black/40 hover:text-black/60'
-                  }`}
-                >
-                  <Mic size={16} /> 음성으로 말하기
-                </button>
-                <button 
-                  onClick={() => setSessionMode('text')}
-                  className={`flex-1 flex items-center justify-center gap-2 py-2.5 rounded-lg text-sm font-medium transition-all ${
-                    sessionMode === 'text' ? 'bg-white shadow-sm text-teal-600' : 'text-black/40 hover:text-black/60'
-                  }`}
-                >
-                  <FileText size={16} /> 직접 입력하기
-                </button>
-              </div>
-
               {/* Input Panel */}
               <div className="card">
-                {sessionMode === 'voice' ? (
-                  <div className="space-y-6">
-                    <p className="text-sm text-black/50">세션 내용을 자유롭게 말씀해주세요. AI가 구조화해드립니다.</p>
-                    <div className="flex items-center gap-6">
-                      <button 
-                        onClick={toggleRecording}
-                        className={`w-16 h-16 rounded-full flex items-center justify-center transition-all ${
-                          isRecording 
-                            ? 'bg-red-50 text-red-500 border-2 border-red-500 animate-pulse' 
-                            : 'bg-white text-teal-500 border-2 border-teal-500'
-                        }`}
-                      >
-                        {isRecording ? <MicOff size={24} /> : <Mic size={24} />}
-                      </button>
-                      <div>
-                        <div className="font-bold">{isRecording ? '듣고 있습니다...' : '버튼을 눌러 시작'}</div>
-                        <p className="text-xs text-black/40 mt-1">예: "오늘 3회기, 호흡 조절 썼고 목소리 떨림 줄었어요."</p>
-                      </div>
-                    </div>
-                    
-                    {voiceText && (
-                      <div className="space-y-3">
-                        <div className="text-[10px] font-bold text-black/30 uppercase tracking-wider">인식된 내용</div>
-                        <div className="p-4 bg-black/5 rounded-xl text-sm leading-relaxed">
-                          {voiceText}
-                        </div>
-                        <div className="flex gap-2">
-                          <button 
-                            onClick={handleRunAI}
-                            disabled={isAiLoading}
-                            className="btn btn-primary btn-sm"
-                          >
-                            {isAiLoading ? '정리 중...' : 'AI로 정리 →'}
-                          </button>
-                          <button onClick={() => setVoiceText('')} className="btn btn-sm">다시 녹음</button>
-                        </div>
-                      </div>
-                    )}
+                <div className="space-y-4">
+                  <div className="space-y-1.5">
+                    <label className="text-xs font-bold text-black/40 uppercase tracking-wider">세션 내용 입력</label>
+                    <textarea 
+                      className="form-input min-h-[150px] resize-none"
+                      placeholder="오늘 진행한 상담/코칭 내용을 자유롭게 입력하세요. (예: 오늘 3회기. 공명 훈련 위주. 학생이 복식호흡 처음 성공.)"
+                      value={freeText}
+                      onChange={(e) => setFreeText(e.target.value)}
+                    />
                   </div>
-                ) : (
-                  <div className="space-y-4">
-                    <div className="space-y-1.5">
-                      <label className="text-xs font-bold text-black/40 uppercase tracking-wider">자유 입력 (AI 정리용)</label>
-                      <textarea 
-                        className="form-input min-h-[120px] resize-none"
-                        placeholder="예: 오늘 3회기. 공명 훈련 위주. 학생이 복식호흡 처음 성공."
-                        value={freeText}
-                        onChange={(e) => setFreeText(e.target.value)}
-                      />
-                    </div>
+                  <div className="flex items-center justify-between">
+                    <p className="text-[11px] text-black/30">AI 정리는 선택 사항입니다. 내용을 입력하고 버튼을 누르면 요약이 생성됩니다.</p>
                     <button 
                       onClick={handleRunAI}
                       disabled={isAiLoading}
-                      className="btn btn-primary btn-sm"
+                      className="btn btn-sm bg-teal-50 text-teal-600 border border-teal-100 hover:bg-teal-100"
                     >
-                      {isAiLoading ? '정리 중...' : 'AI로 정리 →'}
+                      {isAiLoading ? (
+                        <>
+                          <div className="w-3 h-3 border-2 border-teal-600 border-t-transparent rounded-full animate-spin mr-1" />
+                          정리 중...
+                        </>
+                      ) : (
+                        <>
+                          <Sparkles size={14} className="mr-1" />
+                          AI로 요약하기
+                        </>
+                      )}
                     </button>
                   </div>
-                )}
+                </div>
 
                 {aiSummary && (
                   <motion.div 
@@ -713,7 +780,11 @@ export default function App() {
                     <div key={tech} className="flex items-center justify-between p-3 bg-white border border-black/5 rounded-lg">
                       <span className="text-sm font-medium">{tech}</span>
                       <button 
-                        onClick={() => setTechniques(techniques.filter((_, i) => i !== idx))}
+                        onClick={() => {
+                          const newTechs = techniques.filter((_, i) => i !== idx);
+                          setTechniques(newTechs);
+                          updateConfig(newTechs, levels);
+                        }}
                         className="text-black/20 hover:text-red-500 transition-colors"
                       >
                         <Trash2 size={16} />
@@ -735,7 +806,9 @@ export default function App() {
                       if (e.key === 'Enter') {
                         const val = e.currentTarget.value.trim();
                         if (val && !levels.includes(val)) {
-                          setLevels([...levels, val]);
+                          const newLevels = [...levels, val];
+                          setLevels(newLevels);
+                          updateConfig(techniques, newLevels);
                           e.currentTarget.value = '';
                         }
                       }
@@ -746,7 +819,9 @@ export default function App() {
                       const input = document.getElementById('new-level') as HTMLInputElement;
                       const val = input.value.trim();
                       if (val && !levels.includes(val)) {
-                        setLevels([...levels, val]);
+                        const newLevels = [...levels, val];
+                        setLevels(newLevels);
+                        updateConfig(techniques, newLevels);
                         input.value = '';
                       }
                     }}
@@ -758,7 +833,11 @@ export default function App() {
                     <div key={level} className="flex items-center justify-between p-3 bg-white border border-black/5 rounded-lg">
                       <span className="text-sm font-medium">{level}</span>
                       <button 
-                        onClick={() => setLevels(levels.filter((_, i) => i !== idx))}
+                        onClick={() => {
+                          const newLevels = levels.filter((_, i) => i !== idx);
+                          setLevels(newLevels);
+                          updateConfig(techniques, newLevels);
+                        }}
                         className="text-black/20 hover:text-red-500 transition-colors"
                       >
                         <Trash2 size={16} />
@@ -842,6 +921,78 @@ export default function App() {
                 <div className="flex gap-3 pt-2">
                   <button type="button" onClick={() => setIsStudentModalOpen(false)} className="btn flex-1 py-3">취소</button>
                   <button type="submit" className="btn btn-primary flex-1 py-3">저장</button>
+                </div>
+              </form>
+            </motion.div>
+          </div>
+        )}
+      </AnimatePresence>
+
+      {/* Session Modal */}
+      <AnimatePresence>
+        {isSessionModalOpen && editingSession && (
+          <div className="fixed inset-0 z-50 flex items-center justify-center p-6">
+            <motion.div 
+              initial={{ opacity: 0 }}
+              animate={{ opacity: 1 }}
+              exit={{ opacity: 0 }}
+              onClick={() => setIsSessionModalOpen(false)}
+              className="absolute inset-0 bg-black/40 backdrop-blur-sm"
+            />
+            <motion.div 
+              initial={{ opacity: 0, scale: 0.95, y: 20 }}
+              animate={{ opacity: 1, scale: 1, y: 0 }}
+              exit={{ opacity: 0, scale: 0.95, y: 20 }}
+              className="relative bg-white w-full max-w-2xl rounded-2xl shadow-2xl overflow-hidden"
+            >
+              <div className="px-6 py-4 border-b border-black/5 flex items-center justify-between">
+                <div>
+                  <h3 className="font-bold">{editingSession.num}회기 세션 기록 상세</h3>
+                  <p className="text-[11px] text-black/40">{formatDate(editingSession.date)}</p>
+                </div>
+                <button onClick={() => setIsSessionModalOpen(false)} className="text-black/30 hover:text-black/60">
+                  <X size={20} />
+                </button>
+              </div>
+              <form onSubmit={handleUpdateSession} className="p-6 space-y-6 max-h-[80vh] overflow-y-auto">
+                <div className="space-y-1.5">
+                  <label className="text-xs font-bold text-black/40 uppercase tracking-wider">작성한 원문 (수정 가능)</label>
+                  <textarea 
+                    name="reaction"
+                    defaultValue={editingSession.reaction}
+                    className="form-input min-h-[200px] text-sm leading-relaxed"
+                  />
+                </div>
+
+                <div className="space-y-1.5">
+                  <label className="text-xs font-bold text-black/40 uppercase tracking-wider">AI 요약 결과 (수정 가능)</label>
+                  <textarea 
+                    name="aiSummary"
+                    defaultValue={editingSession.aiSummary}
+                    placeholder="AI 요약이 없습니다."
+                    className="form-input min-h-[150px] text-sm leading-relaxed bg-teal-50/30"
+                  />
+                </div>
+
+                <div className="space-y-1.5">
+                  <label className="text-xs font-bold text-black/40 uppercase tracking-wider">다음 세션 방향</label>
+                  <textarea 
+                    name="next"
+                    defaultValue={editingSession.next}
+                    className="form-input min-h-[80px]"
+                  />
+                </div>
+
+                <div className="flex gap-3 pt-2">
+                  <button 
+                    type="button" 
+                    onClick={() => handleDeleteSession(editingSession.id)}
+                    className="btn border-red-100 text-red-500 hover:bg-red-50 px-4"
+                  >
+                    <Trash2 size={18} />
+                  </button>
+                  <button type="button" onClick={() => setIsSessionModalOpen(false)} className="btn flex-1 py-3">취소</button>
+                  <button type="submit" className="btn btn-primary flex-1 py-3">수정 사항 저장</button>
                 </div>
               </form>
             </motion.div>
